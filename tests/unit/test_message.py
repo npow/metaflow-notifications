@@ -2,12 +2,10 @@
 Pure unit tests for resolve_message() and _default_message().
 No mocks needed — this module is entirely side-effect-free.
 """
-import warnings
-import pytest
 
 from metaflow_extensions.notifications.plugins._message import (
-    resolve_message,
     _default_message,
+    resolve_message,
 )
 
 # ---------------------------------------------------------------------------
@@ -86,9 +84,7 @@ def test_default_failure_message_format():
         task_id="3",
         error=ValueError("err"),
     )
-    assert result == "[FAILED] F/1/s/3\nValueError('err')" or (
-        "[FAILED] F/1/s/3" in result
-    )
+    assert result == "[FAILED] F/1/s/3\nValueError('err')" or ("[FAILED] F/1/s/3" in result)
 
 
 def test_default_failure_with_none_error():
@@ -124,6 +120,13 @@ def test_string_template_with_no_error():
     assert result == "MyFlow ok"
 
 
+def test_string_template_error_is_stringified():
+    """error in str templates is str(error), not the live object, for security."""
+    err = ValueError("boom")
+    result = resolve("err={error}", event="failure", error=err)
+    assert result == "err=boom"
+
+
 # ---------------------------------------------------------------------------
 # Bad template → warns and returns raw template (no raise)
 # ---------------------------------------------------------------------------
@@ -133,7 +136,9 @@ def test_bad_template_emits_warning(recwarn):
     result = resolve("{unknown_var} oops", event="failure")
     assert result == "{unknown_var} oops"
     assert len(recwarn.list) == 1
-    assert "unknown_var" in str(recwarn.list[0].message) or "available variables" in str(recwarn.list[0].message).lower()
+    assert (
+        "unknown_var" in str(recwarn.list[0].message) or "available variables" in str(recwarn.list[0].message).lower()
+    )
 
 
 def test_bad_template_no_raise():
@@ -146,6 +151,15 @@ def test_bad_template_warning_mentions_available_vars(recwarn):
     resolve("{oops}", event="failure")
     w = str(recwarn.list[0].message)
     assert "flow_name" in w or "available" in w.lower()
+
+
+def test_format_spec_type_error_warns_and_returns_raw(recwarn):
+    """A template that causes TypeError (e.g. bad format spec) warns and returns raw template."""
+    # error is now str(error) in template context, but an invalid format spec still raises
+    result = resolve("{flow_name!r:invalid_spec}", event="failure")
+    # Should return raw template, not raise
+    assert isinstance(result, str)
+    assert len(recwarn.list) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +178,19 @@ def test_callable_receives_context_kwargs():
     assert captured["flow_name"] == "MyFlow"
     assert captured["step_name"] == "train"
     assert captured["event"] == "failure"
+
+
+def test_callable_receives_live_error_object():
+    """Callables receive the live error object, not a stringified version."""
+    err = ValueError("boom")
+    received = {}
+
+    def capture(**ctx):
+        received["error"] = ctx["error"]
+        return "ok"
+
+    resolve(capture, event="failure", error=err)
+    assert received["error"] is err
 
 
 def test_callable_return_value_used():
@@ -203,6 +230,60 @@ def test_callable_exception_warns_and_returns_none(recwarn):
     result = resolve(bad, event="failure")
     assert result is None
     assert any("RuntimeError" in str(w.message) for w in recwarn.list)
+
+
+def test_callable_returning_broken_str_warns(recwarn):
+    """A callable returning an object whose __str__ raises → returns None with warning."""
+
+    class BrokenStr:
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    result = resolve(lambda **ctx: BrokenStr(), event="failure")
+    assert result is None
+    assert len(recwarn.list) >= 1
+
+
+def test_callable_double_fault_exception_warns(recwarn):
+    """A callable that raises an exception whose __str__ also raises → returns None, doesn't crash."""
+
+    class NastyException(Exception):
+        def __str__(self):
+            raise RuntimeError("str also fails")
+
+    def bad(**ctx):
+        raise NastyException()
+
+    # The fence in _fire closes this; resolve_message only uses type(exc).__name__
+    result = resolve(bad, event="failure")
+    assert result is None
+    # A warning should have been emitted
+    assert len(recwarn.list) >= 1
+
+
+# ---------------------------------------------------------------------------
+# _default_message: repr guard
+# ---------------------------------------------------------------------------
+
+
+def test_bomb_repr_falls_back_gracefully():
+    """An error whose __repr__ raises must not propagate — falls back to unprintable string."""
+
+    class BombRepr(Exception):
+        def __repr__(self):
+            raise RuntimeError("repr bomb")
+
+    result = _default_message(
+        event="failure",
+        flow_name="F",
+        run_id="1",
+        step_name="s",
+        task_id="3",
+        error=BombRepr(),
+    )
+    assert isinstance(result, str)
+    assert "[FAILED]" in result
+    assert "unprintable" in result or "BombRepr" in result
 
 
 # ---------------------------------------------------------------------------

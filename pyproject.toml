@@ -9,7 +9,17 @@ requires-python = ">=3.8"
 dependencies = ["metaflow", "apprise>=1.7"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-mock"]
+dev = ["pytest", "pytest-mock", "pytest-timeout", "ruff", "ty"]
+
+[tool.pytest.ini_options]
+timeout = 30
 
 [tool.setuptools.packages.find]
 include = ["metaflow_extensions*"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

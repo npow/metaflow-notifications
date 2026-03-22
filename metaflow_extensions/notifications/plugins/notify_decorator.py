@@ -1,9 +1,12 @@
 """
 NotifyStepDecorator and NotifyFlowDecorator for metaflow-notifications.
 """
+
+import atexit
 import os
 import warnings
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FuturesTimeoutError
 
 from metaflow.decorators import FlowDecorator, StepDecorator
 
@@ -14,13 +17,6 @@ _foreach_warned = set()
 
 # Remote execution decorator names that cause notifications to be silenced on workers
 _REMOTE_DECORATORS = {"kubernetes", "batch"}
-
-# Map event name → attribute key for message spec lookup
-_EVENT_ATTR = {
-    "failure": "on_failure",
-    "success": "on_success",
-    "start": "on_start",
-}
 
 # Shared defaults — single source of truth for both decorator classes
 _NOTIFY_DEFAULTS = {
@@ -33,14 +29,19 @@ _NOTIFY_DEFAULTS = {
     "title": True,
 }
 
+# URL schemes that are blocked for security
+_BLOCKED_SCHEMES = frozenset(["exec", "file", "cmd", "shell", "python"])
+
 # Thread pool for non-blocking notification dispatch
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mf-notify")
+atexit.register(_executor.shutdown, wait=False)
 
 
 def _check_apprise():
     """Return True if apprise is importable, False otherwise."""
     try:
         import apprise  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -52,7 +53,11 @@ def _dispatch(urls, *, title, body, timeout=10):
     Non-fatal: logs warnings on timeout or delivery failure.
     Does not expose credentials in warnings.
     """
+    import logging
+
     import apprise
+
+    logging.getLogger("apprise").setLevel(logging.WARNING)
 
     ap = apprise.Apprise()
     for url in urls:
@@ -83,13 +88,17 @@ def _dispatch(urls, *, title, body, timeout=10):
 
 class NotifyStepDecorator(StepDecorator):
     name = "notify"
-    defaults = _NOTIFY_DEFAULTS
+    defaults = dict(_NOTIFY_DEFAULTS)
 
     def init(self):
+        if getattr(self, "_ran_init", False):
+            return
+        self._ran_init = True
         self._run_id = None
         self._task_id = "0"
         self._flow_name = "UnknownFlow"
         self._apprise_available = None
+        self._is_foreach_worker = False
 
     def step_init(self, flow, graph, step_name, decorators, environment, flow_datastore, logger):
         self.logger = logger
@@ -121,6 +130,7 @@ class NotifyStepDecorator(StepDecorator):
 
         # Foreach fan-out: only notify from the control task (ubf_context is None)
         if ubf_context is not None:
+            self._is_foreach_worker = True
             key = (run_id, step_name)
             if key not in _foreach_warned:
                 _foreach_warned.add(key)
@@ -149,6 +159,8 @@ class NotifyStepDecorator(StepDecorator):
         retry_count,
         max_user_code_retries,
     ):
+        if self._is_foreach_worker:
+            return
         spec = self.attributes.get("on_success", False)
         if not spec:
             return
@@ -163,12 +175,16 @@ class NotifyStepDecorator(StepDecorator):
         retry_count,
         max_user_code_retries,
     ):
+        if self._is_foreach_worker:
+            return
+
         # Suppress if Metaflow's @catch already handled it
         if type(exception).__name__ == "FailureHandledByCatch":
             return
 
-        # Only notify on the final failure (no more retries remaining)
-        if retry_count < max_user_code_retries:
+        # Only notify on the final failure (no more retries remaining).
+        # max_user_code_retries == -1 means unlimited retries; fire on every exception.
+        if max_user_code_retries != -1 and retry_count < max_user_code_retries:
             return
 
         spec = self.attributes.get("on_failure", True)
@@ -190,49 +206,71 @@ class NotifyStepDecorator(StepDecorator):
             )
             return []
         if isinstance(notifier, str):
-            return [notifier]
-        return list(notifier)
+            raw_urls = [notifier]
+        else:
+            raw_urls = list(notifier)
+
+        safe = []
+        for url in raw_urls:
+            scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+            if scheme in _BLOCKED_SCHEMES:
+                warnings.warn(
+                    f"metaflow-notifications: URL scheme '{scheme}://' is blocked",
+                    stacklevel=3,
+                )
+                continue
+            safe.append(url)
+        return safe
 
     def _fire(self, step_name, run_id, event, spec, *, error=None):
         """Resolve URLs, build message, dispatch notification."""
-        if not self._apprise_available:
-            return
+        try:
+            if not self._apprise_available:
+                return
 
-        urls = self._resolve_urls()
-        if not urls:
-            return
+            urls = self._resolve_urls()
+            if not urls:
+                return
 
-        msg = _message.resolve_message(
-            spec,
-            event=event,
-            flow_name=self._flow_name,
-            run_id=run_id or "?",
-            step_name=step_name,
-            task_id=self._task_id,
-            error=error,
-        )
-        if msg is None:
-            return
+            msg = _message.resolve_message(
+                spec,
+                event=event,
+                flow_name=self._flow_name,
+                run_id=run_id or "?",
+                step_name=step_name,
+                task_id=self._task_id,
+                error=error,
+            )
+            if msg is None:
+                return
 
-        # Build title
-        title_spec = self.attributes.get("title", True)
-        title = _message.resolve_message(
-            title_spec,
-            event=event,
-            flow_name=self._flow_name,
-            run_id=run_id or "?",
-            step_name=step_name,
-            task_id=self._task_id,
-            error=error,
-        ) or f"Metaflow: {self._flow_name}"
+            # Build title
+            title_spec = self.attributes.get("title", True)
+            title = (
+                _message.resolve_message(
+                    title_spec,
+                    event=event,
+                    flow_name=self._flow_name,
+                    run_id=run_id or "?",
+                    step_name=step_name,
+                    task_id=self._task_id,
+                    error=error,
+                )
+                or f"Metaflow: {self._flow_name}"
+            )
 
-        timeout = self.attributes.get("timeout", 10)
-        _dispatch(urls, title=title, body=msg, timeout=timeout)
+            timeout = self.attributes.get("timeout", 10)
+            _dispatch(urls, title=title, body=msg, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"metaflow-notifications: unexpected error in _fire ({type(exc).__name__}); notification suppressed",
+                stacklevel=2,
+            )
 
 
 class NotifyFlowDecorator(FlowDecorator):
     name = "notify"
-    defaults = _NOTIFY_DEFAULTS
+    defaults = dict(_NOTIFY_DEFAULTS)
 
     def flow_init(self, flow, graph, environment, flow_datastore, metadata, logger, echo, options):
         self.logger = logger
@@ -272,10 +310,12 @@ class NotifyFlowDecorator(FlowDecorator):
             # Inject a step decorator with flow-level defaults
             step_deco = NotifyStepDecorator()
             step_deco.attributes = dict(self.attributes)
+            step_deco._ran_init = True
             step_deco._run_id = None
             step_deco._task_id = "0"
             step_deco._flow_name = flow.__class__.__name__
             step_deco._apprise_available = apprise_available
+            step_deco._is_foreach_worker = False
             step_deco.logger = logger
 
             node.decorators.append(step_deco)
