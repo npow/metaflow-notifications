@@ -20,6 +20,9 @@ def _default_message(*, event, flow_name, run_id, step_name, task_id, error=None
         if error is not None:
             try:
                 error_repr = repr(error)
+                # Force plain str to prevent str-subclass __format__ injection
+                # (repr() may return a str subclass whose __format__ runs during f-string interpolation)
+                error_repr = str.__new__(str, error_repr)
             except Exception:
                 error_repr = f"<{type(error).__name__}: unprintable>"
             body += f"\n{error_repr}"
@@ -50,8 +53,13 @@ def resolve_message(spec, *, event, flow_name, run_id, step_name, task_id, error
         )
 
     if isinstance(spec, str):
-        # Use string repr of error to prevent attribute traversal via format specs
-        safe_error = str(error) if error is not None else ""
+        # Force a plain str to prevent str-subclass __format__ injection.
+        # error.__str__() may return a str subclass whose custom __format__ would execute
+        # during spec.format(**ctx), potentially reading attributes from other context values.
+        try:
+            safe_error = str.__new__(str, str(error)) if error is not None else ""
+        except Exception:
+            safe_error = f"<{type(error).__name__}: unprintable>" if error is not None else ""
         ctx = dict(
             flow_name=flow_name,
             run_id=run_id,
@@ -65,12 +73,17 @@ def resolve_message(spec, *, event, flow_name, run_id, step_name, task_id, error
         except Exception as exc:
             available = ", ".join(sorted(ctx.keys()))
             warnings.warn(
-                f"metaflow-notifications: template variable {exc} not found. Available variables: {available}",
+                f"metaflow-notifications: message template could not be formatted "
+                f"({type(exc).__name__}); available variables: {available}",
                 stacklevel=2,
             )
             return spec
 
     if callable(spec):
+        # Security note: the live exception object is passed to the callable with its
+        # __traceback__ intact. Python tracebacks retain references to all local variables
+        # in every stack frame. Callable specs must be trusted code; do not use user-supplied
+        # callables with live exceptions in environments where local variable exposure is a concern.
         ctx_with_live_error = dict(
             flow_name=flow_name,
             run_id=run_id,

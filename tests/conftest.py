@@ -87,3 +87,27 @@ def _fresh_executor(monkeypatch):
     monkeypatch.setattr(_mod, "_executor", fresh)
     yield fresh
     fresh.shutdown(wait=True)
+
+
+@pytest.fixture(autouse=True)
+def _reset_notify_urls(monkeypatch):
+    """Ensure METAFLOW_NOTIFY_URLS is absent between tests.
+
+    Tests that set this variable directly via os.environ (instead of monkeypatch)
+    would otherwise pollute the environment for subsequent tests in the session.
+    Using monkeypatch here guarantees the variable is restored to its pre-test
+    state regardless of how individual tests modify it.
+    """
+    monkeypatch.delenv("METAFLOW_NOTIFY_URLS", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_apprise_logger_flag(monkeypatch):
+    """Reset the module-level apprise logger init flag between tests.
+
+    Without this, the first test that triggers _dispatch configures the apprise
+    logger and sets _apprise_logger_configured=True, preventing subsequent tests
+    from observing the configuration path.
+    """
+    monkeypatch.setattr(_mod, "_apprise_logger_configured", False)

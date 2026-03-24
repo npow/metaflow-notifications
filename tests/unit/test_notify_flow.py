@@ -329,6 +329,9 @@ def test_step_and_flow_defaults_are_independent():
         NotifyStepDecorator,
     )
 
-    NotifyStepDecorator.defaults["_test_sentinel"] = True
-    assert "_test_sentinel" not in NotifyFlowDecorator.defaults
-    del NotifyStepDecorator.defaults["_test_sentinel"]
+    try:
+        NotifyStepDecorator.defaults["_test_sentinel"] = True
+        assert "_test_sentinel" not in NotifyFlowDecorator.defaults
+    finally:
+        # Use pop() with default to avoid KeyError if assertion failed before the key was set
+        NotifyStepDecorator.defaults.pop("_test_sentinel", None)

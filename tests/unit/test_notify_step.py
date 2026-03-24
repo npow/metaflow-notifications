@@ -342,13 +342,16 @@ def test_dispatch_timeout_emits_warning(recwarn, _fresh_executor):
         unblock.wait(timeout=30)
         return True
 
-    with patch("apprise.Apprise") as MockApprise:
-        MockApprise.return_value.notify.side_effect = slow_notify
-        # Very short timeout — thread won't finish in time
-        _dispatch(["slack://x"], title="T", body="B", timeout=0.05)
-
-    # Unblock the background thread so the executor can shut down cleanly
-    unblock.set()
+    try:
+        with patch("apprise.Apprise") as MockApprise:
+            MockApprise.return_value.notify.side_effect = slow_notify
+            # Very short timeout — thread won't finish in time
+            _dispatch(["slack://x"], title="T", body="B", timeout=0.05)
+    finally:
+        # Always unblock the background thread so the executor can shut down cleanly.
+        # Without this finally guard, a raise inside _dispatch would leave the thread
+        # blocked for up to 30 seconds, hanging fixture teardown and the entire suite.
+        unblock.set()
 
     msgs = [str(w.message) for w in recwarn.list]
     assert any("timeout" in m.lower() or "did not complete" in m.lower() for m in msgs)
@@ -574,3 +577,207 @@ def test_init_is_idempotent():
     deco._run_id = "already_set"
     deco.init()  # second call should be a no-op
     assert deco._run_id == "already_set"
+
+
+# ---------------------------------------------------------------------------
+# Retry exhaustion sequence (C10): final retry fires, intermediates suppressed
+# ---------------------------------------------------------------------------
+
+
+def test_retry_exhaustion_sequence(monkeypatch):
+    """Verify full retry cycle: suppressed on attempt 0, 1; fires on attempt 2."""
+    deco = make_step_decorator(on_failure=True)
+    fired = []
+    monkeypatch.setattr(deco, "_fire", lambda *a, **kw: fired.append((a, kw)))
+    exc = RuntimeError("fail")
+
+    deco.task_exception(exc, "train", make_flow(), None, retry_count=0, max_user_code_retries=2)
+    assert len(fired) == 0, "Should not fire on retry_count=0 of 2"
+
+    deco.task_exception(exc, "train", make_flow(), None, retry_count=1, max_user_code_retries=2)
+    assert len(fired) == 0, "Should not fire on retry_count=1 of 2"
+
+    deco.task_exception(exc, "train", make_flow(), None, retry_count=2, max_user_code_retries=2)
+    assert len(fired) == 1, "Should fire exactly once on retry_count=2 of 2"
+
+
+# ---------------------------------------------------------------------------
+# _dispatch: None return treated as delivery failure (M1 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_warns_on_none_return(recwarn):
+    """ap.notify() returning None should also trigger a delivery-failure warning."""
+    with patch("apprise.Apprise") as MockApprise:
+        MockApprise.return_value.notify.return_value = None
+        _dispatch(["slack://x"], title="T", body="B", timeout=5)
+    msgs = [str(w.message) for w in recwarn.list]
+    assert any("falsy" in m.lower() or "delivery" in m.lower() or "failed" in m.lower() for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# _dispatch: ap.add() return value check (M5 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_warns_when_url_not_recognized(recwarn):
+    """When ap.add() returns False for a URL, a warning is emitted."""
+    with patch("apprise.Apprise") as MockApprise:
+        MockApprise.return_value.add.return_value = False
+        MockApprise.return_value.notify.return_value = True
+        _dispatch(["slaack://bad-url"], title="T", body="B", timeout=5)
+    msgs = [str(w.message) for w in recwarn.list]
+    assert any("not recognized" in m.lower() or "skipped" in m.lower() for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# URL filtering: partial filtering (mixed blocked/valid list) (M20)
+# ---------------------------------------------------------------------------
+
+
+def test_partial_url_filtering_passes_valid_drops_blocked(monkeypatch):
+    """A mixed list of blocked and valid URLs: valid ones reach dispatch, blocked ones are dropped."""
+    deco = make_step_decorator(
+        notifier=["file:///etc/passwd", "slack://valid-token"],
+        on_failure=True,
+    )
+    deco._run_id = "r1"
+
+    dispatch_calls = []
+    with patch(
+        "metaflow_extensions.notifications.plugins.notify_decorator._dispatch",
+        side_effect=lambda urls, **kw: dispatch_calls.append(urls),
+    ):
+        deco._fire("train", "r1", "failure", True, error=RuntimeError("x"))
+
+    assert dispatch_calls, "dispatch should have been called with valid URLs"
+    urls_dispatched = dispatch_calls[0]
+    assert "slack://valid-token" in urls_dispatched
+    assert not any("file://" in u for u in urls_dispatched)
+
+
+# ---------------------------------------------------------------------------
+# URL filtering: METAFLOW_NOTIFY_URLS precedence vs. notifier attribute (M22)
+# ---------------------------------------------------------------------------
+
+
+def test_notifier_attribute_takes_precedence_over_env_var(monkeypatch):
+    """When both notifier= and METAFLOW_NOTIFY_URLS are set, notifier= wins."""
+    deco = make_step_decorator(notifier="slack://from-attr", on_failure=True)
+    monkeypatch.setenv("METAFLOW_NOTIFY_URLS", "discord://from-env")
+    deco._run_id = "r1"
+
+    dispatch_calls = []
+    with patch(
+        "metaflow_extensions.notifications.plugins.notify_decorator._dispatch",
+        side_effect=lambda urls, **kw: dispatch_calls.append(urls),
+    ):
+        deco._fire("train", "r1", "failure", True, error=RuntimeError("x"))
+
+    assert dispatch_calls
+    assert dispatch_calls[0] == ["slack://from-attr"]
+
+
+# ---------------------------------------------------------------------------
+# on_success with callable spec (M23)
+# ---------------------------------------------------------------------------
+
+
+def test_on_success_callable_spec_fires_with_event(monkeypatch):
+    """on_success=<callable> receives event='success' in context kwargs."""
+    captured = {}
+
+    def my_spec(**ctx):
+        captured.update(ctx)
+        return "all good"
+
+    deco = make_step_decorator(on_success=my_spec, on_failure=False, notifier="slack://x")
+    deco._run_id = "r1"
+    deco._flow_name = "TestFlow"
+
+    with patch("metaflow_extensions.notifications.plugins.notify_decorator._dispatch"):
+        deco.task_post_step("train", make_flow(), None, 0, 0)
+
+    assert captured.get("event") == "success"
+    assert captured.get("flow_name") == "TestFlow"
+
+
+# ---------------------------------------------------------------------------
+# run_id=0 is not replaced by "?" (M6 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_fire_with_zero_run_id_not_replaced(monkeypatch):
+    """run_id=0 (falsy but valid) must not be replaced with '?'."""
+    deco = make_step_decorator(on_failure=True, notifier="slack://x")
+    deco._run_id = 0
+
+    dispatch_calls = []
+    with patch(
+        "metaflow_extensions.notifications.plugins.notify_decorator._dispatch",
+        side_effect=lambda urls, **kw: dispatch_calls.append(kw),
+    ):
+        deco.task_exception(RuntimeError("boom"), "train", make_flow(), None, 0, 0)
+
+    assert dispatch_calls
+    # "0" should appear in the body, not "?"
+    assert "0" in dispatch_calls[0]["body"]
+    assert dispatch_calls[0]["body"].count("?") == 0
+
+
+# ---------------------------------------------------------------------------
+# SSRF protection: private IP URLs are blocked (C7 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_ssrf_link_local_ip_is_blocked(recwarn, monkeypatch):
+    """http://169.254.169.254 (AWS IMDS) must be blocked."""
+    deco = make_step_decorator(notifier="http://169.254.169.254/latest/meta-data/", on_failure=True)
+    deco._run_id = "r1"
+
+    with patch("metaflow_extensions.notifications.plugins.notify_decorator._dispatch") as mock_dispatch:
+        deco._fire("train", "r1", "failure", True, error=RuntimeError("x"))
+
+    mock_dispatch.assert_not_called()
+    msgs = [str(w.message) for w in recwarn.list]
+    assert any("ssrf" in m.lower() or "private" in m.lower() or "link-local" in m.lower() for m in msgs)
+
+
+def test_ssrf_private_class_a_ip_is_blocked(recwarn, monkeypatch):
+    """http://10.0.0.1 (private RFC1918) must be blocked."""
+    deco = make_step_decorator(notifier="http://10.0.0.1/webhook", on_failure=True)
+    deco._run_id = "r1"
+
+    with patch("metaflow_extensions.notifications.plugins.notify_decorator._dispatch") as mock_dispatch:
+        deco._fire("train", "r1", "failure", True, error=RuntimeError("x"))
+
+    mock_dispatch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# URL scheme normalization bypasses (C3, C4, C5)
+# ---------------------------------------------------------------------------
+
+
+def test_whitespace_padded_scheme_is_blocked(recwarn, monkeypatch):
+    """'file ://...' (whitespace in scheme) must be caught and blocked."""
+    deco = make_step_decorator(notifier="file :///etc/passwd", on_failure=True)
+    deco._run_id = "r1"
+
+    with patch("metaflow_extensions.notifications.plugins.notify_decorator._dispatch") as mock_dispatch:
+        deco._fire("train", "r1", "failure", True, error=RuntimeError("x"))
+
+    mock_dispatch.assert_not_called()
+
+
+def test_data_uri_is_blocked(recwarn, monkeypatch):
+    """data: URIs (no ://) must be caught and blocked."""
+    deco = make_step_decorator(notifier="data:text/plain;base64,aGVsbG8=", on_failure=True)
+    deco._run_id = "r1"
+
+    with patch("metaflow_extensions.notifications.plugins.notify_decorator._dispatch") as mock_dispatch:
+        deco._fire("train", "r1", "failure", True, error=RuntimeError("x"))
+
+    mock_dispatch.assert_not_called()
+    msgs = [str(w.message) for w in recwarn.list]
+    assert any("blocked" in m.lower() or "scheme" in m.lower() for m in msgs)
